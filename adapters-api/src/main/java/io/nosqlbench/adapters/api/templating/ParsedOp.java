@@ -16,6 +16,7 @@
 
 package io.nosqlbench.adapters.api.templating;
 
+import io.nosqlbench.adapters.api.activityconfig.yaml.OpData;
 import io.nosqlbench.adapters.api.activityconfig.yaml.OpTemplate;
 import io.nosqlbench.nb.api.labels.NBLabelSpec;
 import io.nosqlbench.nb.api.labels.NBLabels;
@@ -337,7 +338,7 @@ public class ParsedOp extends NBBaseComponent implements LongFunction<Map<String
         List<Function<Map<String, Object>, Map<String, Object>>> preprocessors,
         NBComponent parent
     ) {
-        super(parent,NBLabels.forKV("op",opTemplate.getName()));
+        super(parent,NBLabels.forKV(((parent instanceof ParsedOp) ? "subop":"op"),opTemplate.getName()));
         this._opTemplate = opTemplate;
         this.activityCfg = activityCfg;
 
@@ -356,7 +357,7 @@ public class ParsedOp extends NBBaseComponent implements LongFunction<Map<String
             activityCfg.getMap())
         );
 
-        NBLabels opLabels = parent.getLabels().and("op", this.getName());
+        NBLabels opLabels = parent.getLabels().and((parent instanceof ParsedOp) ? "subop" : "op", this.getName());
         if (tmap.isStatic("labels")) {
             Object labelSpecObject = tmap.takeStaticValue("labels", Object.class);
             if (labelSpecObject instanceof String labelsSpec) {
@@ -844,6 +845,78 @@ public class ParsedOp extends NBBaseComponent implements LongFunction<Map<String
         return lfa;
     }
 
+    private ParsedOp makeSubOp(String fromOpField, String elemName, String stringOpField) {
+        return makeSubOp(fromOpField, elemName, new LinkedHashMap(Map.of("stmt", stringOpField)));
+    }
+
+    private ParsedOp makeSubOp(String fromOpField, String elemName, Map<String, Object> opfields) {
+        String subopName = opfields.containsKey("name") ? opfields.get("name").toString() : fromOpField + "_" + elemName;
+        return new ParsedOp(
+            new OpData(
+                "sub-op of '" + this.getName() + "' field '" + fromOpField + "', element '" + elemName + "' name '" + subopName + "'",
+                subopName,
+                new LinkedHashMap<String, String>(_opTemplate.getTags()) {{
+                    put("subop", subopName);
+                }},
+                _opTemplate.getBindings(),
+                _opTemplate.getParams(),
+                opfields
+            ),
+            this.activityCfg,
+            List.of(),
+            this
+        );
+    }
+
+    public Map<String, ParsedOp> getAsSubOps(String fromOpField) {
+        Map<String, ParsedOp> subOpMap = new LinkedHashMap<>();
+        Object o = getStaticValue(fromOpField);
+        if (o instanceof List list) {
+            String format = "subop%0" + ((int) Math.log10(list.size()) + 1) + "d";
+            for (int i = 0; i < list.size(); i++) {
+                Object listElem = list.get(i);
+
+                if (listElem instanceof Map lmap) {
+                    ParsedOp parsedOp = makeSubOp(fromOpField, String.format(format, i), lmap);
+                    subOpMap.put(parsedOp.getName(), parsedOp);
+                } else if (listElem instanceof CharSequence stmt) {
+                    ParsedOp parsedOp = makeSubOp(fromOpField, String.format(format, i), stmt.toString());
+                    subOpMap.put(parsedOp.getName(), parsedOp);
+                } else {
+                    throw new OpConfigError("For sub-ops field " + fromOpField + " of op '" + this.getName() + "', element " +
+                        "types must be of Map or String, not '" + o.getClass().getCanonicalName() + "'");
+                }
+            }
+        } else if (o instanceof Map map) {
+            for (Object nameKey : map.keySet()) {
+                Object opref = map.get(nameKey);
+                if (opref instanceof Map fmap) {
+                    ParsedOp subOp = makeSubOp(fromOpField, nameKey.toString(), fmap);
+                    subOpMap.put(subOp.getName(), subOp);
+                } else if (opref instanceof CharSequence stmt) {
+                    ParsedOp subOp = makeSubOp(fromOpField, nameKey.toString(), stmt.toString());
+                    subOpMap.put(subOp.getName(), subOp);
+                } else {
+                    throw new OpConfigError("For sub-ops field " + fromOpField + " of op '" + this.getName() + "', element " +
+                        "types must be of Map or String, not '" + o.getClass().getCanonicalName() + "'");
+                }
+            }
+        } else {
+            throw new OpConfigError("invalid subtype for mapping sub operations in op " + fromOpField + ":" + o.getClass().getCanonicalName());
+        }
+        return subOpMap;
+    }
+
+    public ParsedOp getAsSubOp(String name) {
+        Object o = _opTemplate.getOp().map(raw -> raw.get(name)).orElseThrow(() ->
+            new OpConfigError("Could not find op field '" + name + "' for subop on parent op '" + name + "'"));
+        if (o instanceof Map map) {
+            return makeSubOp(this.getName(), name, map);
+        } else {
+            throw new RuntimeException("Not allowed: op field named '" + name + "' as sub-op");
+        }
+    }
+
 
     /**
      * <p>Enhance an {@link Optional} {@link Function} with an optional named field or value combiner,
@@ -950,4 +1023,51 @@ public class ParsedOp extends NBBaseComponent implements LongFunction<Map<String
     public Map<String, String> getBindPoints() {
         return null;
     }
+
+    public boolean isDefinedExactly(String... fields) {
+        return tmap.isDefinedExactly(fields);
+    }
+
+
+    public <FA,FE,FF> LongFunction<FA> enhanceFuncOptionally2(
+        LongFunction<FA> func,
+        String field,
+        Class<FE> type,
+        String field2,
+        Class<FF> type2,
+        TriFunction<FA,FE,FF> triCombiner
+    ) {
+        Optional<LongFunction<FE>> enhancer1 = getAsOptionalFunction(field, type);
+        if (enhancer1.isEmpty()) {
+            return func;
+        }
+        Optional<LongFunction<FF>> enhancer2 = getAsOptionalFunction(field2, type2);
+        if (enhancer2.isEmpty()) {
+            return func;
+        }
+
+        LongFunction<FE> ef1 = enhancer1.get();
+        LongFunction<FF> ef2 = enhancer2.get();
+
+        LongFunction<FA> lfa = l -> triCombiner.apply(func.apply(l),ef1.apply(l),ef2.apply(l));
+        return lfa;
+    }
+
+    public <FA,FE,FR> LongFunction<FR> enhanceFuncPivot(
+        LongFunction<FA> func,
+        String field,
+        Class<FE> type,
+        BiFunction<FA,FE,FR> combiner
+    ) {
+        Optional<LongFunction<FE>> fieldEnhancerFunc = getAsOptionalFunction(field, type);
+        if (fieldEnhancerFunc.isEmpty()) {
+            throw new RuntimeException("required function enhancer field '" + field + " was not found in op:" + this);
+        }
+        LongFunction<FE> feLongFunction = fieldEnhancerFunc.get();
+        LongFunction<FR> lfa = l -> combiner.apply(func.apply(l),feLongFunction.apply(l));
+        return lfa;
+    }
+
+
+
 }

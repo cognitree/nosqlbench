@@ -16,16 +16,14 @@
 
 package io.nosqlbench.engine.core.lifecycle.session;
 
+import io.nosqlbench.engine.core.lifecycle.scenario.container.NBCommandParams;
+import io.nosqlbench.engine.core.lifecycle.scenario.execution.NBInvokableCommand;
+import io.nosqlbench.nb.api.components.status.NBHeartbeatComponent;
 import io.nosqlbench.nb.api.engine.activityimpl.ActivityDef;
 import io.nosqlbench.nb.api.engine.metrics.instruments.MetricCategory;
-import io.nosqlbench.nb.api.engine.metrics.instruments.NBFunctionGauge;
-import io.nosqlbench.nb.api.engine.metrics.instruments.NBMetricGauge;
 import io.nosqlbench.nb.api.labels.NBLabeledElement;
-import io.nosqlbench.nb.api.labels.NBLabels;
-import io.nosqlbench.nb.api.components.core.NBBaseComponent;
 import io.nosqlbench.nb.api.components.decorators.NBTokenWords;
 import io.nosqlbench.engine.cmdstream.Cmd;
-import io.nosqlbench.engine.core.clientload.*;
 import io.nosqlbench.engine.core.lifecycle.ExecutionResult;
 import io.nosqlbench.engine.core.lifecycle.scenario.container.NBBufferedContainer;
 import io.nosqlbench.engine.core.lifecycle.scenario.container.NBContainer;
@@ -43,7 +41,7 @@ import java.util.function.Function;
  * on.
  * All NBScenarios are run within an NBSession.
  */
-public class NBSession extends NBBaseComponent implements Function<List<Cmd>, ExecutionResult>, NBTokenWords {
+public class NBSession extends NBHeartbeatComponent implements Function<List<Cmd>, ExecutionResult>, NBTokenWords {
     private final static Logger logger = LogManager.getLogger(NBSession.class);
 //    private final ClientSystemMetricChecker clientMetricChecker;
 
@@ -57,19 +55,22 @@ public class NBSession extends NBBaseComponent implements Function<List<Cmd>, Ex
 
     public NBSession(
         NBLabeledElement labelContext,
-        String sessionName
+        String sessionName,
+        Map<String, String> props
     ) {
         super(
             null,
             labelContext.getLabels()
-                .and("session", sessionName)
+                .and("session", sessionName),
+            props,
+            "session"
         );
 
         new NBSessionSafetyMetrics(this);
 
         create().gauge(
             "session_time",
-            () -> (double)System.nanoTime(),
+            () -> (double) System.nanoTime(),
             MetricCategory.Core,
             "session time in nanoseconds"
         );
@@ -82,19 +83,25 @@ public class NBSession extends NBBaseComponent implements Function<List<Cmd>, Ex
 
         // TODO: add container closing command
         // TODO: inject container closing commands after the last command referencing each container
-        List<NBCommandAssembly.CommandInvocation> invocationCalls = NBCommandAssembly.assemble(cmds, this::getContext);
+        List<Cmd> assembledCommands = NBCommandAssembly.assemble(cmds, this::getContext);
         ResultCollector collector = new ResultCollector();
+
         try (ResultContext results = new ResultContext(collector).ok()) {
-            for (NBCommandAssembly.CommandInvocation invocation : invocationCalls) {
-                try {
-                    String targetContext = invocation.containerName();
-                    NBBufferedContainer container = getContext(targetContext);
-                    NBCommandResult cmdResult = container.apply(invocation.command(), invocation.params());
+            for (Cmd cmd : assembledCommands) {
+                String explanation = " in context " + cmd.getTargetContext() + ", command '" + cmd.toString() + "'";
+                try (NBInvokableCommand command = NBCommandAssembly.resolve(cmd,this::getContext)) {
+                    NBCommandParams params = NBCommandAssembly.paramsFor(cmd);
+                    NBBufferedContainer container = getContext(cmd.getTargetContext());
+                    NBCommandResult cmdResult = container.apply(command, params);
                     results.apply(cmdResult);
+                    if (cmdResult.hasException()) {
+                        throw cmdResult.getException();
+                    }
                 } catch (Exception e) {
-                    String msg = "While running command '" + invocation.command() + "' in container '" + invocation.containerName() + "', an error occurred: " + e.toString();
-                    logger.error(msg);
+                    String msg = "While running " + explanation + ", an error occurred: " + e.toString();
                     results.error(e);
+                    onError(e);
+                    logger.error(msg);
                     break;
                 }
             }
