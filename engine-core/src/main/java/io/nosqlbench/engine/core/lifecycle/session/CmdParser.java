@@ -73,7 +73,7 @@ public class CmdParser {
                 while (cmdstructs.peekFirst() instanceof parameter param) {
                     cmdstructs.removeFirst();
                     if (params.containsKey(param.name())) {
-                        throw new BasicError("Duplicate occurrence of option on command line: " + param.name());
+                        throw new BasicError("Duplicate occurrence of option: " + param.name());
                     }
                     params.put(param.name(),CmdArg.of(cmd.name(),param.name(),param.op(),param.value()));
                 }
